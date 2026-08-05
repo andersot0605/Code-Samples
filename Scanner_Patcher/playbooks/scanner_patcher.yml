@@ -1,4 +1,5 @@
 #This is some complex but useful vulnerability analysis and patching automation written in Ansible (primarily for public sector that runs RHEL, and a specific type of Nessus Scanner, if you know you know. There are a few dependencies. Need ansible-core 2.16 or later, need python 3.12 with requests module, need enough Memory on your controller to handle high forks and execution against however many hosts you have at once, theoretically you could run some stuff serial but we chose speed over procedural safety due to the updates being fairly low risk because we exclude the big hitters like kernel.
+#Vulnerability Analysis & Management of Patching and Remediation -- VAMPR
 
 # ==============================================================================*
 # PLAY 0/5: GATHER AND SET GLOBAL VARIABLES
@@ -10,12 +11,9 @@
     - name: "Set hardcoded variables as facts for global access"
       set_fact:
         prompt_email_recipient:
-          - "exampleemail1.example.com"
-          - "exampleemail2.example.com"
-          - "exampleemail3.example.com"
-          - "exampleemail4.example.com"
+          - "trevor.anderson@exampledomain.com"
         prompt_host_domain: "exampledomain.com"
-        prompt_scanner_input: "examplenessusserver.exampledomain.com"
+        prompt_nessus_input: "examplenessussvr@exampledomain.com"
 
     - name: "TASK: Check if 'requests' library is installed on controller"
       ansible.builtin.command: "{{ ansible_playbook_python }} -c 'import requests'"
@@ -31,25 +29,24 @@
       when: requests_check.rc != 0
 
 # ==============================================================================*
-# PLAY 1/5: GATHER VULNERABILITY DATA FROM SCANNER
+# PLAY 1/5: GATHER VULNERABILITY DATA FROM NESSUS
 # ==============================================================================*
-- name: "Play 1/5: Query scanner for Vulnerabilities"
+- name: "Play 1/5: Query NESSUS for Vulnerabilities"
   hosts: all
   gather_facts: no
   tasks:
-    - name: "TASK: Set FQDN and Query scanner"
+    - name: "TASK: Set FQDN and Query NESSUS"
       block:
         - name: "Sub-Task: Construct FQDN"
           set_fact:
             fqdn_target: "{{ inventory_hostname if '.' in inventory_hostname else inventory_hostname ~ '.' ~ hostvars['localhost'].prompt_host_domain }}"
 
-### With the scanner you will get way too much data unless you specify a specific repository that only tracks vulns related to patching. In my case there is a vulnerability scan repository that specifically only includes plugins and cves related to software versions.
-        - name: "Sub-Task: Query Scanner API"
+        - name: "Sub-Task: Query NESSUS API"
           uri:
-            url: "https://{{ hostvars['localhost'].prompt_scanner_input }}/rest/analysis"
+            url: "https://{{ hostvars['localhost'].prompt_nessus_input }}/rest/analysis"
             method: POST
             headers:
-              x-apikey: "accesskey={{ scanner_automation_access_key }}; secretkey={{ scanner_automation_secret }};"
+              x-apikey: "accesskey={{ nessus_automation_access_key }}; secretkey={{ nessus_automation_secret }};"
             body_format: json
             body:
               type: "vuln"
@@ -65,7 +62,7 @@
                   - { filterName: "severity", operator: "=", value: "4,3,2" }
             validate_certs: no
             return_content: yes
-          register: scanner_response_raw
+          register: nessus_response_raw
           delegate_to: localhost
 
         - name: "Sub-Task: Create structured list of vulnerabilities"
@@ -74,7 +71,7 @@
           vars:
             _parsed_vulns_json: >-
               {% set results = [] %}
-              {% for item in scanner_response_raw.json.response.results | default([]) %}
+              {% for item in nessus_response_raw.json.response.results | default([]) %}
                 {% set text = item.pluginText | default('') %}
                 {% set rpm_pairs = text | regex_findall('Remote package installed\\s*:\\s*(\\S+)[\\s\\S]*?Should be\\s*:\\s*(\\S+)') %}
                 {% set fs = item.firstSeen | default(0) | int %}
@@ -94,43 +91,57 @@
                 {% endfor %}
               {% endfor %}
               {{ results | to_json }}
-          when: scanner_response_raw.json.response.results is defined
+          when: nessus_response_raw.json.response.results is defined
 
 # ==============================================================================*
-# PLAY 1.5/5: HOST INFRASTRUCTURE PREPARATION
+# PLAY 1.5/5: HOST INFRASTRUCTURE PREPARATION (ENHANCED)
 # ==============================================================================*
-###The following tasks are related to environmental bugfixes specific to my datacenter. This product works better using a local privileged account for passing DNF commands so that each transaction isnt a 5 way transaction between the controller, destination host, ldap, back to destination host, back to controller, then delivering payload to destination. For that we found our standardized local privileged account has various settings across the environment. Little things like banner responses or expiry timer responses when logging in breaks the automation, so I disable them for this account.
-
 - name: "Play 1.5/5: Host Infrastructure Preparation"
   hosts: all
   gather_facts: no
   become: yes
+  vars:
+    # Force Ansible to use the system's default Python 3 for this play
+    # ansible_python_interpreter: /usr/bin/python3
   tasks:
-    - name: "TASK: Reset pam_faillock counter for local_admin"
-      ansible.builtin.command: "faillock --user local_admin --reset"
+
+    # --- BLOCK 1: GATHER FACTS & INSTALL DEPENDENCIES ---
+    - name: "TASK: Gather minimal facts to check SELinux status"
+      ansible.builtin.setup:
+        filter:
+          - ansible_selinux
+
+    - name: "PREREQ: Ensure all SELinux Python bindings are installed"
+      ansible.builtin.dnf:
+        name:
+          - python3-libselinux
+          - policycoreutils-python-utils
+        state: present
+      # Only run this on hosts where SELinux is actually active
+      when: ansible_selinux.status == "enabled"
+
+    # --- BLOCK 2: MANAGE LOCAL ADMIN ACCOUNT ---
+    - name: "TASK: Reset pam_faillock counter for admin_local"
+      ansible.builtin.command: "faillock --user admin_local --reset"
       register: faillock_reset_raw
-      # Ignore failures if faillock binary is missing (e.g. older RHEL versions) 
-      # or if become fails immediately due to an active lock.
       failed_when: false
       changed_when: false
 
-    - name: "TASK: Check current account aging rules for local_admin"
-      ansible.builtin.command: "chage -l local_admin"
+    - name: "TASK: Check current account aging rules for admin_local"
+      ansible.builtin.command: "chage -l admin_local"
       register: admin_chage_raw
       changed_when: false
       failed_when: false
 
-    - name: "TASK: Configure local_admin aging and disable password expiration"
+    - name: "TASK: Configure admin_local aging and disable password expiration"
       ansible.builtin.user:
-        name: "local_admin"
+        name: "admin_local"
         password_expire_max: 99999
         password_expire_min: 0
-      # Only runs if user exists; native user module handles max/min age idempotently
       when: admin_chage_raw.rc == 0
 
-    - name: "TASK: Disable absolute account expiration and inactive lock for local_admin"
-      ansible.builtin.command: "chage -I -1 -E -1 local_admin"
-      # Only execute this command if the account or inactive lock is not already set to 'never'
+    - name: "TASK: Disable absolute account expiration and inactive lock for admin_local"
+      ansible.builtin.command: "chage -I -1 -E -1 admin_local"
       when:
         - admin_chage_raw.rc == 0
         - >
@@ -139,24 +150,32 @@
       register: chage_unexpire_result
       changed_when: chage_unexpire_result.rc == 0
 
-    - name: "TASK: Restore SELinux contexts on /home2, /root, and /var/log"
+    # --- BLOCK 3: MANAGE SELINUX (ONLY IF ENABLED) ---
+    - name: "TASK: Ensure correct SELinux context for DNF/YUM logging"
+      ansible.builtin.sefcontext:
+        target: '/var/log/dnf.log'
+        setype: 'var_log_t'
+        state: present
+      when: ansible_selinux.status == "enabled"
+
+    - name: "TASK: Restore SELinux contexts on critical paths"
       ansible.builtin.command: "restorecon -Rv /home2 /root /var/log"
       register: restorecon_output
-      # Smart check: only marks as changed if files were actually relabeled
       changed_when: "'Relabeled' in restorecon_output.stdout"
       failed_when: false
+      when: ansible_selinux.status == "enabled"
 
 # ==============================================================================*
-# PLAY 2/5: LOCAL DNF CHECKS
+# PLAY 2/5: LOCAL DNF CHECKS (RESTORED TO ORIGINAL HIGH-SPEED)
 # ==============================================================================*
 - name: "Play 2/5: Local DNF Checks"
   hosts: all
   gather_facts: no
   become: yes
+
   tasks:
     - name: "TASK: Force DNF Metadata Refresh"
       ansible.builtin.command: "dnf makecache"
-      become: yes
       changed_when: false
 
     - name: "TASK: Execute Consolidated Sudo Checks (Bypasses Repeated PAM Hits)"
@@ -181,9 +200,61 @@
           stdout_lines: "{{ (local_checks_raw.stdout.split('===START_IDENTITY===')[1] | trim).split('\n') }}"
 
 # ==============================================================================*
+# PLAY 2.5/5: SATELLITE REGISTRATION RECOVERY (Corrected Logic)
+# ==============================================================================*
+- name: "Play 2.5/5: Satellite Registration Recovery"
+  hosts: all
+  gather_facts: no
+  become: yes
+  serial: 10                  # Controls the batch size for recovery
+  any_errors_fatal: false
+  tasks:
+    - name: "TASK: Evaluate Drift from Desired Configuration"
+      set_fact:
+        # Looking for 'Library' inside the subscription-manager identity output
+        is_drifted: "{{ 'Library' not in (hostvars[inventory_hostname].subman_identity.stdout | default('')) }}"
+
+    # This block executes the fix natively without nested include_tasks issues
+    - name: "RECOVERY BLOCK: Fix registration drift"
+      block:
+        - name: "REG-FIX: Determine RHEL major version (Corrected)"
+          set_fact:
+            # The parentheses are critical for correct evaluation order.
+            rhel_version: "{{ ('el9' in (dnf_installed_result.stdout | default(''))) | ternary('9', '8') }}"
+
+        - name: "REG-FIX: Force clean unregister/re-register host to 'Library'"
+          ansible.builtin.command: >
+            subscription-manager register
+            --org="557_Weather_Wing"
+            --activationkey="RHEL{{ rhel_version }}"
+            --force
+          register: register_result
+          throttle: 5 # Safe throttle to protect Satellite's database thread
+          until: register_result.rc == 0
+          retries: 3
+          delay: 10
+
+        - name: "REG-FIX: Clean and rebuild DNF cache after registration"
+          ansible.builtin.shell: "dnf clean all && dnf makecache"
+          when: register_result.rc == 0
+
+        # Update the dnf upgrades fact so Play 4/5 knows what updates are now available
+        - name: "REG-FIX: Update upgrades list for recovered host"
+          ansible.builtin.shell: "dnf list upgrades --quiet || true"
+          register: recovered_dnf_upgrades
+          changed_when: false
+
+        - name: "REG-FIX: Save updated upgrades fact"
+          set_fact:
+            dnf_upgrades_result:
+              stdout: "{{ recovered_dnf_upgrades.stdout | trim }}"
+
+      # ONLY trigger this block if the host actually has drift!
+      when: is_drifted | bool
+
+# ==============================================================================*
 # PLAY 3/5: CHECK SATELLITE FOR ALL UNIQUE PACKAGES
 # ==============================================================================*
-#I use pause: 0.1 on the query satellite API task because it thought I was doing a denial of service attack when I ran a large amount of queries simultaneously. 
 - name: "Play 3/5: Query Red Hat Satellite for Exact Packages"
   hosts: localhost
   connection: local
@@ -195,7 +266,7 @@
         
     - name: "TASK: Query Satellite API for package availability"
       uri:
-        url: "https://examplerhsatserver.exampledomain.com/katello/api/packages?search=nvra={{ item.fix_version | urlencode }}"
+        url: "https://examplesatelliteserver@exampledomain.com/katello/api/packages?search=nvra={{ item.fix_version | urlencode }}"
         method: GET
         user: "{{ local_sat_user }}"
         password: "{{ local_sat_pass }}"
@@ -220,95 +291,6 @@
       no_log: true
 
 # ==============================================================================*
-# PLAY 3.5/5: CONTENT VIEW PROMOTION FOR TARGET ENVIRONMENTS
-# ==============================================================================*
-- name: "Play 3.5/5: Promote Content Views for Target Environments"
-  hosts: localhost
-  connection: local
-  gather_facts: no
-  tasks:
-    - name: "Initialize promotion variables"
-      set_fact:
-        inventory_cv_details: {}
-        cv_promoted_hosts: []
-
-    - name: "TASK: Identify unique CV/LE/Org pairs from all hosts in inventory"
-      set_fact:
-        inventory_cv_details: "{{ inventory_cv_details | combine({item: {'cv': cv_name, 'le': le_name, 'org': org_name}}, recursive=true) }}"
-      loop: "{{ groups['all'] }}"
-      vars:
-        subman_lines: "{{ hostvars[item].subman_identity.stdout_lines | default([]) }}"
-        
-        env_line: "{{ subman_lines | select('search', 'environment name:') | first | default('') }}"
-        raw_env: "{{ env_line.split(':', 1)[-1] | trim }}"
-        le_name: "{{ raw_env.split('/')[0] | trim if '/' in raw_env else (raw_env | trim if raw_env != '' else 'Library') }}"
-        cv_name: "{{ raw_env.split('/', 1)[-1] | trim if '/' in raw_env else (raw_env | trim if raw_env != '' else 'Unknown') }}"
-        
-        org_line: "{{ subman_lines | select('search', 'org name:') | first | default('') }}"
-        org_name: "{{ org_line.split(':', 1)[-1] | trim if ':' in org_line else 'Unknown' }}"
-
-    - name: "TASK: Check for deltas and build exact list of needed promotions"
-      set_fact:
-        cv_promotions_needed: "{{ _promotions_json | from_json }}"
-      vars:
-        _promotions_json: >-
-          {% set promos = [] %}
-          {% for host in groups['all'] %}
-            {% set cv = inventory_cv_details[host].cv %}
-            {% set le = inventory_cv_details[host].le %}
-            {% set org = inventory_cv_details[host].org %}
-            
-            {% if le != 'Library' %}
-              {% set ns = namespace(delta=false) %}
-              {% for vuln in hostvars[host].vulnerability_list | default([]) %}
-                {% set is_in_sat = hostvars['localhost'].sat_lookup[vuln.fix_version] | default(false) %}
-                {% set dnf_out = hostvars[host].dnf_upgrades_result.stdout | default('') %}
-                
-                {% if is_in_sat and not (vuln.base_pkg in dnf_out) %}
-                  {% set ns.delta = true %}
-                {% endif %}
-              {% endfor %}
-              
-              {% if ns.delta %}
-                {% set promo = {'cv': cv, 'le': le, 'org': org} %}
-                {% if promo not in promos %}
-                  {% set _ = promos.append(promo) %}
-                {% endif %}
-              {% endif %}
-            {% endif %}
-          {% endfor %}
-          {{ promos | to_json }}
-
-    - name: "TASK: Publish and Promote Content View"
-      redhat.satellite.content_view_version:
-        server_url: "https://examplerhsatserver.exampledomain.com"
-        username: "{{ local_sat_user }}"
-        password: "{{ local_sat_pass }}"
-        validate_certs: no
-        organization: "{{ item.org }}"
-        content_view: "{{ item.cv }}"
-        lifecycle_environments:
-          - "{{ item.le }}"
-      loop: "{{ cv_promotions_needed }}"
-      register: promotion_results
-      when: cv_promotions_needed | length > 0
-
-    - name: "TASK: Set flag for hosts whose CV was promoted"
-      set_fact:
-        cv_promoted_hosts: "{{ cv_promoted_hosts + [host.key] }}"
-      loop: "{{ inventory_cv_details | dict2items }}"
-      loop_control:
-        loop_var: host
-      vars:
-        host_cv_le:
-          cv: "{{ host.value.cv }}"
-          le: "{{ host.value.le }}"
-          org: "{{ host.value.org }}"
-      when:
-        - cv_promotions_needed | length > 0
-        - host_cv_le in cv_promotions_needed
-
-# ==============================================================================*
 # PLAY 4/5: AUTO-REMEDIATION
 # ==============================================================================*
 - name: "Play 4/5: Targeted Remediation"
@@ -316,7 +298,7 @@
   gather_facts: no
   become: yes
   vars:
-    reboot_packages_regex: '^(kernel.*|glib2|glibc|dbus.*|systemd.*|linux-firmware)$'
+    reboot_packages_regex: '^(kernel.*|kmod.*|glibc.*|systemd.*|dbus.*|linux-firmware.*|dracut.*|grub2.*|shim.*|microcode_ctl.*|rke2.*|container.*|docker.*)$'
   tasks:
     - name: "TASK: Pause for 2 minutes if a CV was promoted to allow clients to sync"
       ansible.builtin.pause:
@@ -370,6 +352,11 @@
         msg: "Remediated the following on {{ inventory_hostname }}: {{ remediation_targets | join(', ') }}"
       when: remediation_targets | length > 0 and dnf_update_output.changed
 
+    # --- 🔀 NEW CONDITIONAL HOOKS FOR TEAMS ---
+    - name: "TASK: Trigger Team-Specific Post-Patch Hooks"
+      ansible.builtin.include_tasks: "conditional_tasks/post_patch_hooks.yml"
+      when: dnf_update_output.changed | default(false)
+
 # ==============================================================================*
 # PLAY 5/5: REPORT EXPORT AND DISTRIBUTION
 # ==============================================================================*
@@ -377,143 +364,109 @@
   hosts: localhost
   gather_facts: no
   vars:
-    # NOTE: If you want glibc to auto-patch, remove it from this regex in Plays 4 and 5
+    # NOTE: If you want glibc or any other reboot-sensitive package to auto-patch, remove it from this regex in Plays 4 and 5
     reboot_packages_regex: '^(kernel.*|glib2|glibc|dbus.*|systemd.*|linux-firmware)$'
   tasks:
     - name: "TASK: Generate Dynamic CSV Filename"
       set_fact:
-        csv_filename: "./scanner_vulnerability_report_{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}.csv"
-        
-    - name: "TASK: Build Final Report Data with Remediation Status"
-      set_fact:
-        report_rows: "{{ _report_json | from_json }}"
+        csv_filename: "./nessus_vulnerability_report_{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}.csv"
+
+    - name: "TASK: Generate JSON input for Python script"
+      ansible.builtin.copy:
+        content: "{{ ansible_input_data | to_json }}"
+        dest: "/tmp/vampr_report_input.json"
       vars:
-        _report_json: >-
-          {% set res = [] %}
-          {% for vuln in master_vuln_list %}
-            {% set host = vuln['host'] %}
-            {% set sat_status = hostvars['localhost'].sat_lookup[vuln['fix_version']] | default(false) %}
-            {% set dnf_res = hostvars[host].dnf_upgrades_result | default({}) %}
-            {% set dnf_out = dnf_res.stdout | default('') %}
-            
-            {% set cv_promoted_flag = "Yes" if (hostvars['localhost'].cv_promoted_hosts | default([]) | length > 0) else "No" %}
-            {% set reboot_req = "Yes" if (vuln['base_pkg'] is regex(reboot_packages_regex)) else "No" %}
-            
-            {% set was_patched = 'No' %}
-            {% if hostvars[host].dnf_update_output is defined and hostvars[host].dnf_update_output.changed %}
-              {% if vuln['base_pkg'] in (hostvars[host].remediation_targets | default([])) %}
-                {% set was_patched = 'Yes' %}
-              {% endif %}
-            {% endif %}
-            
-            {# Extract pure version string to check if it's already installed #}
-            {% set fix_ver_stripped = vuln['fix_version'] | regex_replace('^' ~ vuln['base_pkg'] ~ '-', '') | regex_replace('\\.(x86_64|noarch|i686|aarch64)$', '') %}
-            {% set dnf_installed_out = hostvars[host]['dnf_installed_result'].stdout | default('') %}
-            {% set is_already_installed = (fix_ver_stripped in dnf_installed_out) %}
-            
-            {% set needs_rescan = 'Yes (Already Installed)' if (is_already_installed and was_patched == 'No') else 'No' %}
-            
-            {% set found = namespace(exists=false) %}
-            {% for row in res %}
-              {# UPDATED: Added host matching to prevent incorrect state flattening #}
-              {% if row['id'] == vuln['plugin_id'] and row['fix'] == vuln['fix_version'] and host in row['scanner_hosts'] %}
-                {% set found.exists = true %}
-              {% endif %}
-            {% endfor %}
-            
-            {% if not found.exists %}
-              {% set item_dict = {
-                'name': vuln['vuln_name'] | default('Unknown'),
-                'id': vuln['plugin_id'] | default('Unknown'),
-                'sev': vuln['severity'] | default('Unknown'),
-                'first_seen': vuln['first_seen'] | default('Unknown'),
-                'patch_pub': vuln['patch_pub'] | default('Unknown'),
-                'aff': vuln['affected_version'] | default('Unknown'),
-                'fix': vuln['fix_version'] | default('Unknown'),
-                'sat': ('Yes' if sat_status else 'No'),
-                'dnf': ('Yes' if (vuln['base_pkg'] in dnf_out) else 'No'),
-                'cv_promoted': cv_promoted_flag,
-                'reboot_req': reboot_req,
-                'patched': was_patched,
-                'needs_rescan': needs_rescan,
-                'scanner_hosts': [host]
-              } %}
-              {% set ignored = res.append(item_dict) %}
-            {% endif %}
-          {% endfor %}
-          {{ res | to_json }}
-          
+        ansible_input_data:
+          master_vuln_list: "{{ hostvars['localhost'].master_vuln_list }}"
+          sat_lookup: "{{ hostvars['localhost'].sat_lookup | default({}) }}"
+          hostvars: "{{ hostvars }}"
+          reboot_packages_regex: "{{ reboot_packages_regex }}"
+          cv_promoted_hosts: "{{ hostvars['localhost'].cv_promoted_hosts | default([]) }}"
+
+    - name: "TASK: Build Final Report Data via Python for Performance"
+      ansible.builtin.shell: "python3 process_report.py < /tmp/vampr_report_input.json"
+      register: report_processor_result
+      changed_when: false
+
+    - name: "TASK: Set Final Report Rows from Python Script Output"
+      set_fact:
+        report_rows: "{{ report_processor_result.stdout | from_json }}"
+
+    - name: "TASK: Clean up temporary JSON input file"
+      ansible.builtin.file:
+        path: "/tmp/vampr_report_input.json"
+        state: absent
+
     - name: "TASK: Generate CSV File"
       copy:
         dest: "{{ csv_filename }}"
         content: |
-          Vulnerability Name,Plugin ID,Severity,First Discovered,Patch Published,Affected Version,Fix Version,Satellite Available,DNF Available,CV Promoted,Reboot Required,Patched,Needs Rescan,Host
+          Vulnerability Name,Plugin ID,Severity,First Discovered,Patch Published,Affected Version,Fix Version,Satellite Available,Upgrade Available,CV Promoted,Reboot Required,Patched,Needs Rescan,Affected Hosts
           {% for row in report_rows %}
-          "{{ row.name }}",{{ row.id }},{{ row.sev }},"{{ row.first_seen }}","{{ row.patch_pub }}","{{ row.aff }}","{{ row.fix }}",{{ row.sat }},{{ row.dnf }},{{ row.cv_promoted }},{{ row.reboot_req }},{{ row.patched }},"{{ row.needs_rescan }}","{{ row.scanner_hosts | unique | sort | join(', ') }}"
+          "{{ row.name }}",{{ row.id }},{{ row.sev }},"{{ row.first_seen }}","{{ row.patch_pub }}","{{ row.aff }}","{{ row.fix }}",{{ row.sat }},{{ row.upgrade_available }},{{ row.cv_promoted }},{{ row.reboot_req }},{{ row.patched }},"{{ row.needs_rescan }}","{{ row.nessus_hosts }}"
           {% endfor %}
           
     - name: "TASK: Email CSV Report"
       mail:
         host: localhost
         port: 25
-        from: "examplegroupemail.exampledomain.com"
+        from: "exampleemail@exampledomain.com"
         to: "{{ prompt_email_recipient | join(',') }}"
-        subject: "Mission Report: scanner_patcher Vulnerability Remediation Tracking"
+        subject: "Mission Report: Nessus Vulnerability Remediation Tracking"
         body: |
           Attached is the vulnerability cross-reference report.
-          - CV Promoted: Indicates if a Content View was promoted for the host's Lifecycle environment.
+          - CV Promoted: Indicates if a Content View was promoted for any affected host's Lifecycle environment.
           - Reboot Required: Indicates if the vulnerability fix requires a system reboot to take effect.
-          - Patched: Indicates if the playbook automatically applied the fix via DNF.
-          - Needs Rescan: Indicates "Yes (Already Installed)" if scanner reported a vulnerability but DNF confirms the fixed version is already present on the system (indicating scanner data is stale).
+          - Patched: Indicates if the playbook automatically applied the fix via DNF on any affected hosts.
+          - Needs Rescan: Indicates "Yes" if nessus reported a vulnerability but DNF confirms the fixed version is already present on any affected system (indicating nessus data is stale).
         attach:
           - "{{ csv_filename }}"
       delegate_to: localhost
 
 # ==============================================================================*
-# PLAY 5.5/5: LAUNCH AD-HOC scanner RESCAN
+# PLAY 5.5/5: LAUNCH AD-HOC nessus RESCAN
 # ==============================================================================*
-###Scaner for api usage needs specific things. API token associated with an account with necessary permissions, must own all aspects of the scan it wants to interact with, so the scan itself, scan policy, and asset list if applicable, but I am using IP/DNS for targets instead.
-- name: "Play 5.5/5: Mission - Ad-Hoc scanner Scan Launch"
+- name: "Play 5.5/5: Mission - Ad-Hoc NESSUS Scan Launch"
   hosts: localhost
   connection: local
   gather_facts: no
   vars:
     # Ensure this matches your Tenable.sc configured Scan ID
-    scanner_scan_id: "1432"
+    nessus_scan_id: "1432"
   tasks:
     - name: "TASK: Build comma-separated list of simple hostnames"
       set_fact:
         # Directly joins inventory hostnames without needing fact gathering
-        scanner_target_list: "{{ groups['all'] | join(',') }}"
+        nessus_target_list: "{{ groups['all'] | join(',') }}"
 
     - name: "TASK: Ensure we have targets to scan"
       fail:
         msg: "No targets found in the inventory to scan."
-      when: scanner_target_list | length == 0
+      when: nessus_target_list | length == 0
 
     - name: "TASK: Display targets to be updated"
       debug:
-        msg: "Overwriting Scan ID {{ scanner_scan_id }} targets with: {{ scanner_target_list }}"
+        msg: "Overwriting Scan ID {{ nessus_scan_id }} targets with: {{ nessus_target_list }}"
 
-    - name: "TASK: Step 1 - Hard Overwrite scanner Scan Targets"
+    - name: "TASK: Step 1 - Hard Overwrite NESSUS Scan Targets"
       uri:
-        url: "https://{{ hostvars['localhost'].prompt_scanner_input }}/rest/scan/{{ scanner_scan_id }}"
+        url: "https://{{ hostvars['localhost'].prompt_nessus_input }}/rest/scan/{{ nessus_scan_id }}"
         method: PATCH
         headers:
-          x-apikey: "accesskey={{ scanner_automation_access_key }}; secretkey={{ scanner_automation_secret }};"
+          x-apikey: "accesskey={{ nessus_automation_access_key }}; secretkey={{ nessus_automation_secret }};"
         body_format: json
         body:
-          ipList: "{{ scanner_target_list }}"
+          ipList: "{{ nessus_target_list }}"
         validate_certs: no
         status_code: 200
       register: scan_update_result
 
-    - name: "TASK: Step 2 - Launch the updated scanner Scan"
+    - name: "TASK: Step 2 - Launch the updated NESSUS Scan"
       uri:
-        url: "https://{{ hostvars['localhost'].prompt_scanner_input }}/rest/scan/{{ scanner_scan_id }}/launch"
+        url: "https://{{ hostvars['localhost'].prompt_nessus_input }}/rest/scan/{{ nessus_scan_id }}/launch"
         method: POST
         headers:
-          x-apikey: "accesskey={{ scanner_automation_access_key }}; secretkey={{ scanner_automation_secret }};"
+          x-apikey: "accesskey={{ nessus_automation_access_key }}; secretkey={{ nessus_automation_secret }};"
         body_format: json
         body: {}
         validate_certs: no
@@ -527,3 +480,50 @@
           - "Scan Name: {{ scan_update_result.json.response.name | default('N/A') }}"
           - "Status: Scan targets successfully overwritten and scan launched!"
 
+# ==============================================================================*
+# PLAY 6: FORWARD VAMPR METRICS TO SPLUNK
+# ==============================================================================*
+- name: "Play 6: Forward VAMPR Remediation Data to Splunk"
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  tasks:
+    - name: "TASK: Ensure report_rows exists before forwarding"
+      ansible.builtin.assert:
+        that:
+          - hostvars['localhost'].report_rows is defined
+        msg: "No report_rows data found to send to Splunk."
+      ignore_errors: yes
+      register: splunk_precheck
+
+    - name: "TASK: Forward vulnerability tracking data to Splunk HEC"
+      ansible.builtin.uri:
+        # Note: Ensure your OpenBao 'splunk_hec_url' includes the full path 
+        # e.g., https://<splunk_host>:8088/services/collector/event
+        url: "{{ splunk_hec_url }}"
+        method: POST
+        headers:
+          Authorization: "Splunk {{ splunk_hec_token }}"
+        body_format: json
+        body:
+          host: "vampr-controller"
+          source: "vampr_playbook"
+          sourcetype: "_json"
+          event: "{{ item }}"
+        validate_certs: no  # Set to yes if your Splunk HEC uses a trusted CA
+        status_code: [200, 201]
+      # Loop through the aggregated JSON objects created for the CSV in Play 5
+      loop: "{{ hostvars['localhost'].report_rows | default([]) }}"
+      loop_control:
+        label: "Forwarding Plugin ID {{ item.id }} to Splunk"
+        pause: 0.1 # Slight pause to prevent HEC endpoint throttling
+      when: splunk_precheck is not failed
+      register: splunk_result
+      until: splunk_result.status in [200, 201]
+      retries: 3
+      delay: 5
+
+    - name: "TASK: Splunk Forwarding Status"
+      ansible.builtin.debug:
+        msg: "Successfully forwarded {{ hostvars['localhost'].report_rows | length }} events to Splunk."
+      when: splunk_precheck is not failed
