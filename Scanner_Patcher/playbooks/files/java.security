@@ -1,0 +1,2 @@
+#### This is a placeholder. When this was written we had specific considerations to be placed in the java.security file. I will not be posting what they were here but know that when jdk is patched this file is overwritten with default values.
+#That is why we had a "golden" version of the file living here to be replaced whenever java was updated.
