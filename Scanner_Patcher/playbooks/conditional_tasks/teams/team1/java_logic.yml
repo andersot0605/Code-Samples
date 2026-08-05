@@ -1,0 +1,21 @@
+# /vampr/playbooks/tasks/teams/team1/java_logic.yml
+---
+- name: "TEAM HOOK: Check if Java/JDK was patched"
+  set_fact:
+    java_was_patched: "{{ remediation_targets | select('search', '(?i)(java|jdk)') | list | length > 0 }}"
+
+- name: "TEAM HOOK: Enforce java.security baseline"
+  ansible.builtin.copy:
+    src: "files/java.security"
+    dest: "/usr/jdk/entsys-j2se/jre/lib/security/java.security"
+    owner: root
+    group: root
+    mode: '0644'
+    backup: yes
+  when: java_was_patched | bool
+  register: java_sec_update
+
+- name: "TEAM HOOK: Summary of Enforcement"
+  ansible.builtin.debug:
+    msg: "Java/JDK was patched. Enforced custom java.security profile on {{ inventory_hostname }}."
+  when: java_sec_update.changed | default(false)
