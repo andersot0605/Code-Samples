@@ -1,0 +1,13 @@
+[hosttype1test]
+exampleredhatserver[01:09].exampledomain.com
+
+[hosttype2test]
+exampleredhatserver[10:19].exampledomain.com
+
+[hosttype1prod]
+exampleredhatserver[20:29].exampledomain.com
+
+[hosttype2prod]
+exampleredhatserver[30:39].exampledomain.com
+
+[hosttype3test]

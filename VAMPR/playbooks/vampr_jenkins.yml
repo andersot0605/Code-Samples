@@ -424,7 +424,7 @@
       delegate_to: localhost
 
 # ==============================================================================*
-# PLAY 5.5/5: LAUNCH AD-HOC nessus RESCAN
+# PLAY 5.5/5: LAUNCH AD-HOC NESSUS RESCAN
 # ==============================================================================*
 - name: "Play 5.5/5: Mission - Ad-Hoc NESSUS Scan Launch"
   hosts: localhost
