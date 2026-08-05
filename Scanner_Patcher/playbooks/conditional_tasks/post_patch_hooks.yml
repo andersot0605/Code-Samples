@@ -1,0 +1,39 @@
+# ==============================================================================*
+# 🚦 VAMPR POST-PATCH HOOKS (DELEGATOR)
+# ==============================================================================*
+# 
+# Welcome! This file acts as a "traffic cop" for team-specific automations.
+# It ONLY runs if the main VAMPR playbook actually installed an update via DNF.
+# 
+# We use this file to keep the main VAMPR playbook clean. If your team needs 
+# special actions to occur after patching (e.g., copying config files, restarting
+# services, sending Slack alerts), you will register them here.
+#
+# 🛠️ HOW TO ADD YOUR TEAM'S LOGIC:
+#
+# STEP 1: Create your custom YAML file
+#   Create a new file in the `conditional_tasks/teams/` directory.
+#   Example: `conditional_tasks/teams/myteam_hooks.yml`
+#
+# STEP 2: Register your file below
+#   Add an `include_tasks` block at the bottom of this file. Give it a clear
+#   name, point it to your new file, and MOST IMPORTANTLY, restrict it to 
+#   your specific server groups using a `when:` statement.
+#
+# --- COPY/PASTE TEMPLATE ---
+# - name: "ROUTER: [Your Team Name] Post-Patch Actions"
+#   ansible.builtin.include_tasks: "teams/your_team_file.yml"
+#   when: 
+#     - group_names | intersect(['your-group-1', 'your-group-2']) | length > 0
+# ---------------------------
+
+# ==============================================================================*
+# 🚀 ACTIVE TEAM ROUTERS BELOW
+# ==============================================================================*
+---
+
+- name: "TEAM1: Evaluate JMS & EDH Java Security Baseline"
+  ansible.builtin.include_tasks: "teams/team1/java_logic.yml"
+  when: 
+    - group_names | intersect(['hosttype1test', 'hosttype2test', 'hosttype1prod', 'hosttype2prod']) | length > 0
+
