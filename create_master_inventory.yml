@@ -1,6 +1,8 @@
-### This simpler play uses the URI module to reach out to your organizations RedHat Satellite Server and grab all registered hosts
 ---
-- name: Generate Static Inventory from Satellite
+# ==============================================================================
+# Play 1: Fetch hosts from Satellite API & register in memory
+# ==============================================================================
+- name: Fetch Host List from RedHat Satellite
   hosts: localhost
   gather_facts: false
   connection: local
@@ -18,47 +20,81 @@
 
   tasks:
     - name: Ensure the server URL starts with https://
-      set_fact:
+      ansible.builtin.set_fact:
         final_url: "{{ 'https://' ~ satellite_server_hostname if not satellite_server_hostname.startswith('http') else satellite_server_hostname }}"
 
-    - name: Call Satellite API to get all hosts in one page
-      uri:
-        url: "{{ final_url }}/api/v2/hosts?per_page=500" # Need to ask for a large number to ensure you get all servers that are subscribed
+    - name: Call Satellite API to get all hosts
+      ansible.builtin.uri:
+        url: "{{ final_url }}/api/v2/hosts?per_page=500"
         method: GET
         user: "{{ satellite_user }}"
         password: "{{ satellite_password }}"
         force_basic_auth: yes
         validate_certs: no
         return_content: yes
-        timeout: 120 # Keeping a generous timeout just in case, if API call takes a while it can timeout and fail
+        timeout: 120
       register: satellite_api_result
 
     - name: Check if API call was successful
-      fail:
+      ansible.builtin.fail:
         msg: "API call failed. Status: {{ satellite_api_result.status }}. Message: {{ satellite_api_result.msg | default('No message') }}"
       when: satellite_api_result.status != 200
 
     - name: Check if any hosts were returned
-      fail:
+      ansible.builtin.fail:
         msg: "API call succeeded, but no hosts were found."
       when: satellite_api_result.json.results | length == 0
 
-    - name: Create a header for the inventory file
-      lineinfile:
-        path: "./all_hosts.ini"
-        line: "[satellite_hosts]"
-        create: yes
-        mode: '0644'
-
-    - name: Add each discovered host to the all_hosts.ini file
-      lineinfile:
-        path: "./all_hosts.ini"
-        line: "{{ item.name }}"
-      # The host list from the API is in the 'results' key
+    - name: Dynamically populate in-memory group 'discovered_hosts'
+      ansible.builtin.add_host:
+        name: "{{ item.name }}"
+        groups: discovered_hosts
       loop: "{{ satellite_api_result.json.results }}"
       loop_control:
         label: "{{ item.name }}"
 
-    - name: Report success
-      debug:
-        msg: "Successfully generated inventory file: all_hosts.ini. Found {{ satellite_api_result.json.results | length }} hosts."
+# ==============================================================================
+# Play 2: Ping all discovered hosts & collect reachables
+# ==============================================================================
+- name: Test Host Connectivity
+  hosts: discovered_hosts
+  gather_facts: false
+  ignore_unreachable: true
+
+  tasks:
+    - name: Ping host via Ansible SSH
+      ansible.builtin.ping:
+      register: ping_result
+
+    - name: Add reachable host to 'reachable_hosts' group
+      ansible.builtin.add_host:
+        name: "{{ inventory_hostname }}"
+        groups: reachable_hosts
+      when: ping_result is succeeded
+
+# ==============================================================================
+# Play 3: Generate the final inventory file containing reachable hosts only
+# ==============================================================================
+- name: Generate Inventory File
+  hosts: localhost
+  gather_facts: false
+  connection: local
+
+  tasks:
+    - name: Initialize or reset inventory file
+      ansible.builtin.copy:
+        content: "[satellite_hosts]\n"
+        dest: "./all_hosts.ini"
+        mode: '0644'
+
+    - name: Append reachable hosts to inventory file
+      ansible.builtin.lineinfile:
+        path: "./all_hosts.ini"
+        line: "{{ item }}"
+      loop: "{{ groups['reachable_hosts'] | default([]) }}"
+
+    - name: Summary report
+      ansible.builtin.debug:
+        msg: >-
+          Discovered {{ groups['discovered_hosts'] | length }} host(s).
+          Successfully wrote {{ groups['reachable_hosts'] | default([]) | length }} reachable host(s) to all_hosts.ini.
