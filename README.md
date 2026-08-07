@@ -53,6 +53,6 @@ I am always open to discussing advanced enterprise infrastructure design, large-
 
 *   **LinkedIn:** [Trevor Anderson](https://linkedin.com)  
 *   **GitHub Portfolio:** [andersot0605](https://github.com)
-*   **Interests Beyond Engineering:** Outside of tech, I am always up for a conversation about golf, working out, bowling, video games, anime, or pop culture.
+*   **Interests Beyond Engineering:** Outside of tech, I am always up for a conversation about football, golf, exercise, learning, bowling, video games, anime, or pop culture.
 
 > *"Automate everything you think you'll do more than twice."*
