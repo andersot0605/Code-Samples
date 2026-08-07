@@ -225,7 +225,7 @@
         - name: "REG-FIX: Force clean unregister/re-register host to 'Library'"
           ansible.builtin.command: >
             subscription-manager register
-            --org="557_Weather_Wing"
+            --org="exampleorg"
             --activationkey="RHEL{{ rhel_version }}"
             --force
           register: register_result
